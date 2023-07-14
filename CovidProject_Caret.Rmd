@@ -1,0 +1,171 @@
+---
+title: "Untitled"
+author: "Nate"
+date: "2023-07-12"
+output: html_document
+---
+
+
+
+Declare libraries to global environment
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(BH)
+```
+
+
+
+
+
+```{r}
+
+
+
+setwd("C:/Users/Nate/BCM/Covid Project/")
+CaseReport <- read.csv('CaseReportFormCOVID_edited_RF.csv')
+CovidBatch <- read.csv('Covid_Batch_1_to_3_corrected.csv')
+CovidBatch <- filter(CovidBatch, (Group != "Adult Control" & Group != "Covid" &
+                                             Group != "Adult Covid" & Group != "ID"))
+
+
+CovidBatch <- filter(CovidBatch, Batch != 3)
+CovidBatch <- CovidBatch[,2:162]
+
+
+
+```
+
+
+
+```{r}
+
+
+
+batch.1 <- filter(CovidBatch, Batch == 1)
+batch.2 <- filter(CovidBatch, Batch == 2)
+
+
+#anova based on batch
+#t.test.result <- lapply(CovidBatch[2], function(x) aov(x ~ Group, data = CovidBatch))
+#anova.test <- anova(t.test.result$Batch)
+
+
+
+# Specify the threshold for NA values
+na_threshold <- 10  # Remove columns with more than 10 NAs
+
+# Identify columns with NAs exceeding the threshold
+columns_to_remove <- colnames(CovidBatch)[colSums(is.na(CovidBatch)) > na_threshold]
+
+# Remove the identified columns from the dataset
+CovidBatch.filtered <- CovidBatch[, !colnames(CovidBatch) %in% columns_to_remove]
+
+
+analyte_list <- colnames(CovidBatch.filtered[, 3:115])
+
+
+pval <- c()
+x <- 2     #first two columns are groups and id
+for ( i in analyte_list) {
+  x <- x + 1
+  print(i)
+  data_aov <- aov(CovidBatch.filtered[,x] ~ CovidBatch.filtered$Group, CovidBatch.filtered)
+  data_test <- anova(data_aov)
+  pval <- append(pval,data_test[1,5])
+  
+}
+
+
+analyte_pval <- data.frame(
+  analyte = analyte_list,
+  pval = pval
+)
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r}
+
+
+#remove batch number and sampleID to give us analyte readings only
+analytes.only <- CovidBatch.filtered[,3:115]
+
+set.seed("42")
+
+pre.process <- preProcess(analytes.only, method = "bagImpute")
+
+
+imputed.data <- predict(pre.process, analytes.only)
+imputed.data$Group <- CovidBatch$Group
+
+
+train.index <- createDataPartition(imputed.data$Group, 
+                p = .7,
+                list = FALSE,
+                times = 1
+)
+
+
+full.train <- imputed.data[train.index,]
+test.2 <- imputed.data[-train.index,]
+
+full.train$Group <- as.factor(full.train$Group)
+
+
+
+```
+
+
+
+
+
+
+``` {r}
+
+fit.control <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated 5 times
+                           repeats = 3)
+
+
+set.seed("42")
+
+group.model <- train( Group ~ ., 
+                      data = full.train,
+                      method = "kknn",
+                      trControl = fit.control,
+                      verbose = TRUE)
+
+
+confusionMatrix(group.model)
+varImp(group.model)
+
+
+
+group.model.predict <- predict(group.model, newdata = test.2)
+confusionMatrix(data = group.model.predict, reference = as.factor(test.2$Group))
+
+
+```
+
+
+
+
