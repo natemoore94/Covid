@@ -1,0 +1,388 @@
+---
+title: "Covid"
+author: "Nate"
+date: "2023-07-24"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(BH)
+library(stats)
+
+```
+
+
+
+```{r}
+
+setwd("C:/Users/Nate/BCM/Covid Project/")
+CaseReport <- read.csv('CaseReportFormCOVID_edited_RF.csv')
+CovidBatch <- read.csv('Covid_Batch_1_to_3_corrected.csv')
+CovidBatch <- filter(CovidBatch, (Group != "Adult Control" & Group != "Covid" &
+                                             Group != "Adult Covid" & Group != "ID"))
+
+
+
+
+CovidBatchAll <- CovidBatch
+CovidBatch <- CovidBatch[,2:161]
+all.analytes <- colnames(CovidBatch[,3:160])
+
+MISC.columns <- c(all.analytes, "MISC")
+
+
+```
+
+
+
+
+
+
+
+Data Cleaning for group prediction purposes
+
+```{r}
+
+
+# Remove columns with too many NA's
+na_threshold <- 15  # Remove columns with more than 15 NAs
+columns_to_remove <- colnames(CovidBatch)[colSums(is.na(CovidBatch)) > na_threshold]
+CovidBatch.filtered <- CovidBatch[, !colnames(CovidBatch) %in% columns_to_remove]
+
+#remove batch number and sampleID to give us analyte readings only
+analytes.only <- CovidBatch.filtered[,3:120]
+
+#set seed for reproducibility
+set.seed("42")
+
+#Impute missing data with bagImpute
+pre.process <- preProcess(analytes.only, method = "bagImpute")
+
+#use bagImputed data to predict missing values
+imputed.data <- predict(pre.process, analytes.only)
+imputed.data$Group <- CovidBatch$Group
+
+
+```
+
+
+
+
+
+
+
+Data cleaning for MISC purposes - 52 pediatric covid results
+
+```{r}
+
+setwd("C:/Users/Nate/BCM/Covid Project/")
+CovidBatch.1 <- read.csv('Covid_Batch_1_to_3_corrected.csv')
+
+CovidBatch.1 <- filter(CovidBatch.1, (Group != "Adult Control" &
+                                             Group != "Adult Covid" & Group != "ID"))
+
+merged_data <- merge(
+  CaseReport,
+  CovidBatch.1,
+  by.x = "Protocol.I.D.",
+  by.y = "SampleID",
+  all.x = TRUE
+)
+
+merged_data <- merged_data %>%  rename("MISC" = "Virus.related.complications..acute.....choice.MIS.C.")
+merged_data <- merged_data[!is.na(merged_data$Group), ]
+array.tools <- merged_data  %>% group_by(MISC) %>% summarise(n())
+array.tools
+remove_incomplete <- merged_data[complete.cases(merged_data$MISC)]
+threshold <- nrow(remove_incomplete) * 0.3
+cleaned_data <- remove_incomplete[, colSums(is.na(remove_incomplete)) <= threshold]
+cleaned_data <- cleaned_data %>%  filter(cleaned_data$Age.at.COVID.19.diagnosis..yrs.. < 19)
+days.param <- cleaned_data %>% filter( Lowest < 14)
+na_threshold <- 10  # Remove columns with more than 10 NAs
+columns_to_remove <- colnames(days.param)[colSums(is.na(days.param)) > na_threshold]
+days.param.filtered <- days.param[, !colnames(days.param) %in% columns_to_remove]
+days.param.filtered$Respiratory.failure <- days.param.filtered$Virus.related.complications..acute.....choice.Respiratory.failure.
+training.set <- days.param.filtered[, intersect(names(days.param.filtered), c(all.analytes, "MISC", "Respiratory.failure", "Highest.level.of.Care."))]
+
+array.tools <- cleaned_data  %>% group_by(MISC) %>% summarise(n())
+array.tools
+
+
+set.seed("54321")
+partition.data <- createDataPartition(training.set$MISC,   #partition data before feature selection
+                                      p = .7,
+                                      list = FALSE,
+                                      times = 1)
+training.partition <- training.set[ partition.data,]
+testing.partition <- training.set[-partition.data,]
+
+
+set.seed("54321")
+pre.process.training <- preProcess(training.partition[,3:116], method = "bagImpute")
+training.imputed <- predict(pre.process.training, training.partition[,3:116])
+training.imputed$MISC <- training.partition$MISC
+training.imputed$Respiratory.failure <- training.partition$Respiratory.failure
+training.imputed$Highest.level.of.Care. <- training.partition$Highest.level.of.Care.
+
+
+p.val.df <- training.imputed[,1:111]
+p.val.df <- p.val.df[,c(111, 1:110)]
+analyte_list <- colnames(p.val.df[,2:111])
+ttest_results <- lapply(p.val.df[-1], function(x) t.test(x ~ p.val.df$MISC))
+result_df <- data.frame(
+  variable = names(p.val.df[-1]),
+  p_value = sapply(ttest_results, function(result) result$p.value)
+)
+
+  
+
+
+
+result_df <- result_df[order(result_df$p_value), ]
+sig.pval <- head(result_df, 20)
+#training.imputed <- training.imputed[, c(sig.pval$variable, "MISC")]
+
+
+
+
+
+set.seed("54321")
+pre.process.test  <- preProcess(testing.partition[,3:116], method = "bagImpute")
+testing.imputed <- predict(pre.process.test, testing.partition[,3:116])
+testing.imputed$MISC <- testing.partition$MISC
+testing.imputed$Respiratory.failure <- testing.partition$Respiratory.failure
+testing.imputed$Highest.level.of.Care. <- testing.partition$Highest.level.of.Care.
+
+
+length(training.imputed$MISC)
+length(testing.imputed$MISC)
+
+
+```
+
+
+
+
+
+
+MISC model
+``` {r}
+
+
+
+training.imputed$MISC <- as.factor(training.imputed$MISC)
+training.imputed.MISC <- training.imputed[, intersect(names(training.imputed),c(all.analytes, "MISC"))]
+
+set.seed("54321")
+fit.control <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated 3 times
+                           repeats = 3)
+set.seed("54321")
+
+MISC.model <- train( MISC ~ ., 
+                      data = training.imputed.MISC,
+                      method = "regLogistic",
+                      trControl = fit.control,
+                      verbose = FALSE,
+                      verbosity = 0)
+
+
+
+confusionMatrix(MISC.model)
+imp.var <- varImp(MISC.model)
+group.model.predict.MISC <- predict(MISC.model, newdata = testing.imputed)
+confusionMatrix(data = group.model.predict.MISC, reference = as.factor(testing.imputed$MISC))
+
+
+
+#var.imp <- imp.var$importance
+
+#confusionMatrix(MISC.model)
+#imp.var <- varImp(MISC.model)
+#group.model.predict.MISC <- predict(MISC.model, newdata = testing.imputed)
+#confusionMatrix(data = group.model.predict.MISC, reference = as.factor(testing.imputed$MISC))
+```
+
+
+
+
+```{r}
+
+var.imp <- var.imp[order(var.imp$Checked, decreasing = TRUE),]
+var.imp.20 <- head(var.imp, 20) 
+
+training.imputed.MISC <- training.imputed.MISC[, c("MISC", rownames(var.imp.20))]
+
+MISC.model <- train( MISC ~ ., 
+                      data = training.imputed.MISC,
+                      method = "regLogistic",
+                      trControl = fit.control,
+                      verbose = FALSE,
+                      verbosity = 0)
+
+
+
+confusionMatrix(MISC.model)
+imp.var <- varImp(MISC.model)
+group.model.predict.MISC <- predict(MISC.model, newdata = testing.imputed)
+confusionMatrix(data = group.model.predict.MISC, reference = as.factor(testing.imputed$MISC))
+
+
+
+
+
+```
+
+
+
+
+
+Respiratory failure model
+
+```{r}
+
+
+
+#training.imputed$MISC <- as.factor(training.imputed$MISC)
+training.imputed$Respiratory.failure <- as.factor(training.partition$Respiratory.failure)
+testing.imputed$Respiratory.failure <- as.factor(testing.partition$Respiratory.failure)
+#testing.imputed <- testing.imputed[,c(1:20, 22)]
+training.imputed.resp <- training.imputed[,intersect(names(training.imputed),c(all.analytes, "Respiratory.failure"))]
+
+
+
+fit.control <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated 3 times
+                           repeats = 3)
+
+
+resp.model <- train( Respiratory.failure ~ ., 
+                      data = training.imputed.resp,
+                      method = "regLogistic",
+                      trControl = fit.control,
+                      verbose = FALSE,
+                      verbosity = 0)
+
+imp.var <- varImp(resp.model)
+var.imp <- imp.var$importance
+var.imp <- var.imp[order(var.imp$Checked, decreasing = TRUE),]
+var.imp.20 <- head(var.imp, 20) 
+
+training.imputed.resp <- training.imputed.resp[, c("Respiratory.failure", rownames(var.imp.20))]
+
+
+
+
+resp.model <- train( Respiratory.failure ~ ., 
+                      data = training.imputed.resp,
+                      method = "regLogistic",
+                      trControl = fit.control,
+                      verbose = FALSE,
+                      verbosity = 0)
+
+
+
+
+confusionMatrix(resp.model)
+varImp(resp.model)
+group.model.predict.resp <- predict(resp.model, newdata = testing.imputed)
+confusionMatrix(data = group.model.predict.resp, reference = as.factor(testing.imputed$Respiratory.failure))
+
+
+
+
+
+
+```
+
+
+```{r}
+
+MISC.model
+
+```
+
+
+
+
+
+ICU prediction model
+
+
+```{r}
+
+
+training.imputed$Highest.level.of.Care. <- training.partition$Highest.level.of.Care.
+testing.imputed$Highest.level.of.Care. <- testing.partition$Highest.level.of.Care.
+training.imputed <- training.imputed %>% filter(Highest.level.of.Care. != "")
+testing.imputed <- testing.imputed %>%  filter(Highest.level.of.Care. != "")
+training.imputed <- training.imputed[,c(1:20, 22)]
+
+
+fit.control <- trainControl(## 5-fold CV
+                           method = "repeatedcv",
+                           number = 5,
+                           ## repeated 3 times
+                           repeats = 3)
+
+
+MISC.model <- train(Highest.level.of.Care. ~ ., 
+                      data = training.imputed,
+                      method = "regLogistic",
+                      trControl = fit.control,
+                      verbose = TRUE,
+                      verbosity = 0)
+
+
+
+
+confusionMatrix(MISC.model)
+varImp(MISC.model)
+group.model.predict.MISC <- predict(MISC.model, newdata = testing.imputed)
+confusionMatrix(data = group.model.predict.MISC, reference = as.factor(testing.imputed$Highest.level.of.Care.))
+
+
+
+
+
+confusionMatrix(MISC.model)
+varImp(MISC.model)
+group.model.predict.MISC <- predict(MISC.model, newdata = testing.imputed)
+confusionMatrix(data = group.model.predict.MISC, reference = as.factor(testing.imputed$Highest.level.of.Care.))
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
